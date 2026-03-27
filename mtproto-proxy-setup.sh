@@ -1,9 +1,9 @@
 #!/bin/bash
 #=============================================================================
-#  Telegram MTProto 代理 一键部署脚本 (增强版)
+#  Telegram MTProto 代理 一键部署脚本 (增强版 v2)
 #  适用系统: Ubuntu 18.04+ / Debian 10+ / CentOS 7+
 #  用法: bash mtproto-proxy-setup.sh
-#  特性: 自动安装 Docker、防火墙配置、密钥生成、健康检查
+#  基于 nineseconds/mtg (Go 实现，兼容新版 Telegram)
 #=============================================================================
 
 set -eo pipefail
@@ -19,11 +19,10 @@ BOLD='\033[1m'
 
 #======================= 配置变量 =======================
 INSTALL_DIR="/opt/mtproto-proxy"
-DOCKER_COMPOSE_FILE="$INSTALL_DIR/docker-compose.yml"
-CONFIG_FILE="$INSTALL_DIR/proxy-secret"
-SERVICE_NAME="mtproto-proxy"
+CONFIG_FILE="$INSTALL_DIR/config.toml"
+CONNECTION_FILE="$INSTALL_DIR/connection-info.txt"
 PORT_RANGE_START=1443
-PORT_RANGE_END=1543
+DOCKER_IMAGE="nineseconds/mtg:2"
 
 #======================= 工具函数 =======================
 info()    { echo -e "${GREEN}[INFO]${NC} $1"; }
@@ -103,7 +102,6 @@ install_docker() {
 
     info "Docker 版本: $(docker --version)"
 
-    # Docker Compose 兜底
     if ! docker compose version &>/dev/null 2>&1; then
         warn "Docker Compose 插件未安装，正在安装独立版..."
         local compose_arch
@@ -173,29 +171,6 @@ install_docker_debian() {
     success "Docker 安装完成"
 }
 
-generate_mtg_secret() {
-    # 方式一：用 mtg 容器生成 dd 开头的 TLS 伪装密钥
-    local secret=""
-    local err_output
-    
-    # 先确保镜像存在
-    err_output=$(docker pull 9seconds/mtg:latest 2>&1)
-    if [[ $? -eq 0 ]]; then
-        secret=$(docker run --rm 9seconds/mtg:latest generate-secret --tls 2>/dev/null) || true
-    fi
-    
-    # 方式二：如果 mtg 生成失败，用 openssl 手动构造 dd 密钥
-    # dd + 32字节随机hex = 正确的 mtg TLS 伪装密钥
-    if [[ -z "$secret" ]]; then
-        warn "mtg 密钥生成失败，使用 openssl 兜底..."
-        local random_hex
-        random_hex=$(openssl rand -hex 32)
-        secret="dd${random_hex}"
-    fi
-    
-    echo "$secret"
-}
-
 get_server_ip() {
     local ip
     ip=$(curl -s4 --max-time 5 ip.sb 2>/dev/null) || \
@@ -243,11 +218,7 @@ deploy_proxy() {
     echo -e "${CYAN}${BOLD}       🚀 部署 Telegram MTProto 代理${NC}"
     divider
 
-    local secret
-    info "正在生成代理密钥..."
-    secret=$(generate_mtg_secret)
-    info "已生成代理密钥: ${secret:0:6}...${secret: -4}"
-
+    # 获取端口
     local port="${MTG_PORT:-$PORT_RANGE_START}"
     if [[ -t 0 ]]; then
         read -rp "请设置代理端口 (默认 $port): " input_port
@@ -256,53 +227,67 @@ deploy_proxy() {
         info "使用默认端口: $port"
     fi
 
+    # 获取服务器 IP
     local server_ip
     server_ip=$(get_server_ip)
     info "服务器 IP: ${BOLD}$server_ip${NC}"
 
+    # 创建安装目录
     mkdir -p "$INSTALL_DIR"
 
-    # ========== 9seconds/mtg: Go 实现，兼容新版 Telegram ==========
-    cat > "$DOCKER_COMPOSE_FILE" <<EOF
-version: '3.8'
+    # ========== 拉取镜像 ==========
+    divider
+    info "正在拉取镜像 ${DOCKER_IMAGE}..."
+    divider
 
-services:
-  mtproto-proxy:
-    image: 9seconds/mtg:latest
-    container_name: mtproto-proxy
-    restart: always
-    network_mode: host
-    command: run ${secret} --port ${port}
-    volumes:
-      - proxy-data:/var/lib/mtproto-proxy
-    healthcheck:
-      test: ["CMD", "nc", "-z", "127.0.0.1", "${port}"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 10s
+    if ! docker pull "$DOCKER_IMAGE" 2>&1; then
+        error "镜像拉取失败，请检查网络或手动执行: docker pull $DOCKER_IMAGE"
+        exit 1
+    fi
+    success "镜像拉取完成"
 
-volumes:
-  proxy-data:
-    name: mtproto-proxy-data
+    # ========== 生成密钥 ==========
+    info "正在生成代理密钥..."
+    local secret
+    secret=$(docker run --rm "$DOCKER_IMAGE" generate-secret --hex www.google.com 2>/dev/null) || true
+
+    if [[ -z "$secret" ]]; then
+        warn "容器生成密钥失败，使用 openssl 兜底..."
+        local random_b64
+        random_b64=$(openssl rand -base64 24 | tr '+/' '-_' | tr -d '=')
+        secret="ee${random_b64}$(printf '%s' 'www.google.com' | base64 | tr '+/' '-_' | tr -d '=')"
+    fi
+
+    info "已生成密钥: ${secret:0:8}...${secret: -8}"
+
+    # ========== 生成配置文件 ==========
+    cat > "$CONFIG_FILE" <<EOF
+secret = "${secret}"
+bind-to = "0.0.0.0:${port}"
 EOF
 
-    echo "$secret" > "$CONFIG_FILE"
     chmod 600 "$CONFIG_FILE"
 
+    # 配置防火墙
     configure_firewall "$port"
 
+    # ========== 启动代理 ==========
     divider
-    info "正在拉取镜像并启动代理..."
+    info "正在启动代理..."
     divider
 
-    # 先停掉可能存在的旧容器
+    # 停掉可能存在的旧容器
     docker stop mtproto-proxy 2>/dev/null || true
     docker rm mtproto-proxy 2>/dev/null || true
 
-    cd "$INSTALL_DIR"
-    docker compose up -d
+    docker run -d \
+        --name mtproto-proxy \
+        --restart unless-stopped \
+        -p "${port}:${port}" \
+        -v "$CONFIG_FILE":/config.toml:ro \
+        "$DOCKER_IMAGE"
 
+    # 等待容器启动
     echo -n "等待代理启动"
     for i in $(seq 1 20); do
         if docker ps --filter "name=mtproto-proxy" --filter "status=running" -q | grep -q .; then
@@ -319,7 +304,9 @@ EOF
         exit 1
     fi
 
-    # tg:// 格式的链接 (Telegram 客户端直接识别)
+    success "代理启动成功"
+
+    # ========== 显示结果 ==========
     local tg_link="tg://proxy?server=${server_ip}&port=${port}&secret=${secret}"
 
     divider
@@ -344,10 +331,7 @@ EOF
     echo -e "     密钥:   ${GREEN}${secret}${NC}"
     echo ""
     echo -e "  ${YELLOW}方式二: 快速链接${NC}"
-    echo -e "  在 Telegram 中发送此链接并点击: ${CYAN}${tg_link}${NC}"
-    echo ""
-    echo -e "  ${YELLOW}方式三: HTTPS 伪装链接${NC}"
-    echo -e "  在 Telegram 中发送并点击: ${CYAN}https://t.me/proxy?server=${server_ip}&port=${port}&secret=${secret}${NC}"
+    echo -e "  在 Telegram 中发送此消息并点击: ${CYAN}${tg_link}${NC}"
     echo ""
     divider
     echo -e "${YELLOW}💡 常用管理命令:${NC}"
@@ -357,10 +341,11 @@ EOF
     echo -e "  启动代理:  ${CYAN}docker start mtproto-proxy${NC}"
     echo -e "  重启代理:  ${CYAN}docker restart mtproto-proxy${NC}"
     echo -e "  卸载代理:  ${CYAN}bash $0 --uninstall${NC}"
-    echo -e "  查看连接信息: ${CYAN}bash $0 --info${NC}"
+    echo -e "  查看信息:  ${CYAN}bash $0 --info${NC}"
     divider
 
-    cat > "$INSTALL_DIR/connection-info.txt" <<EOF
+    # 保存连接信息
+    cat > "$CONNECTION_FILE" <<EOF
 ==========================================
   Telegram MTProto 代理连接信息
 ==========================================
@@ -368,22 +353,21 @@ EOF
 端口:   $port
 密钥:   $secret
 
-快速连接链接:
+快速连接:
 $tg_link
-https://t.me/proxy?server=${server_ip}&port=${port}&secret=${secret}
 
 生成时间: $(date '+%Y-%m-%d %H:%M:%S')
 ==========================================
 EOF
-    success "连接信息已保存到 $INSTALL_DIR/connection-info.txt"
+    success "连接信息已保存到 $CONNECTION_FILE"
 }
 
 show_info() {
-    if [[ ! -f "$INSTALL_DIR/connection-info.txt" ]]; then
+    if [[ ! -f "$CONNECTION_FILE" ]]; then
         error "未找到代理配置信息，请先部署"
         exit 1
     fi
-    cat "$INSTALL_DIR/connection-info.txt"
+    cat "$CONNECTION_FILE"
 }
 
 uninstall_proxy() {
@@ -396,63 +380,17 @@ uninstall_proxy() {
         exit 0
     fi
 
-    cd "$INSTALL_DIR" 2>/dev/null || true
-    docker compose down --volumes --rmi local 2>/dev/null || \
-    docker-compose down --volumes --rmi local 2>/dev/null || \
-    docker stop mtproto-proxy 2>/dev/null && docker rm mtproto-proxy 2>/dev/null
-
+    docker stop mtproto-proxy 2>/dev/null || true
+    docker rm mtproto-proxy 2>/dev/null || true
     rm -rf "$INSTALL_DIR"
-    docker volume rm mtproto-proxy-data 2>/dev/null || true
 
     success "MTProto 代理已完全卸载"
-}
-
-reconfigure_proxy() {
-    if [[ ! -f "$DOCKER_COMPOSE_FILE" ]]; then
-        error "未找到代理配置，请先部署"
-        exit 1
-    fi
-
-    divider
-    info "重新配置 MTProto 代理..."
-    divider
-
-    info "正在生成新密钥..."
-    local new_secret
-    new_secret=$(generate_mtg_secret)
-    if [[ -z "$new_secret" ]]; then
-        error "密钥生成失败"
-        exit 1
-    fi
-
-    cd "$INSTALL_DIR"
-    sed -i "s|command: run .* --port|command: run ${new_secret} --port|" "$DOCKER_COMPOSE_FILE"
-    echo "$new_secret" > "$CONFIG_FILE"
-
-    docker compose down
-    docker compose up -d
-
-    sleep 3
-
-    if docker ps --filter "name=mtproto-proxy" --filter "status=running" -q | grep -q .; then
-        success "代理已重新配置并启动"
-        echo ""
-        echo -e "  ${BOLD}新密钥:${NC} ${GREEN}${new_secret}${NC}"
-        local server_ip
-        server_ip=$(get_server_ip)
-        local port
-        port=$(grep -E '^\s+- "[0-9]+' "$DOCKER_COMPOSE_FILE" | grep -oE '[0-9]+' | head -1)
-        echo -e "  ${BOLD}连接链接:${NC} ${CYAN}tg://proxy?server=${server_ip}&port=${port}&secret=${new_secret}${NC}"
-    else
-        error "代理重启失败"
-        docker logs mtproto-proxy 2>&1 | tail -10
-    fi
 }
 
 show_help() {
     echo ""
     divider
-    echo -e "${CYAN}${BOLD}  Telegram MTProto 代理 一键部署脚本 (增强版)${NC}"
+    echo -e "${CYAN}${BOLD}  Telegram MTProto 代理 一键部署脚本 (增强版 v2)${NC}"
     divider
     echo ""
     echo -e "  ${BOLD}用法:${NC} bash $0 [选项]"
@@ -461,7 +399,6 @@ show_help() {
     echo -e "    (无参数)      一键部署 MTProto 代理"
     echo -e "    --info        查看代理连接信息"
     echo -e "    --uninstall   卸载 MTProto 代理"
-    echo -e "    --reconfig    重新生成密钥并重启代理"
     echo -e "    --help        显示帮助信息"
     echo ""
     echo -e "  ${BOLD}环境变量:${NC}"
@@ -470,7 +407,7 @@ show_help() {
     divider
 }
 
-#======================= 主流程 ========================
+#======================= 主流程 =======================
 main() {
     case "${1:-}" in
         --info)
@@ -480,11 +417,6 @@ main() {
         --uninstall)
             check_root
             uninstall_proxy
-            exit 0
-            ;;
-        --reconfig)
-            check_root
-            reconfigure_proxy
             exit 0
             ;;
         --help|-h)
@@ -506,7 +438,7 @@ main() {
     echo -e "${CYAN}${BOLD}"
     echo "  ╔══════════════════════════════════════╗"
     echo "  ║   Telegram MTProto 代理 一键部署     ║"
-    echo "  ║   9seconds/mtg · 兼容新版 Telegram  ║"
+    echo "  ║   nineseconds/mtg · 兼容新版 TG     ║"
     echo "  ╚══════════════════════════════════════╝"
     echo -e "${NC}"
     divider

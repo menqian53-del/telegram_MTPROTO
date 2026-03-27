@@ -173,9 +173,14 @@ install_docker_debian() {
     success "Docker 安装完成"
 }
 
-generate_secret() {
+generate_mtg_secret() {
+    # 使用 mtg 容器生成正确的 secret 格式
+    # 先拉取镜像（如果还没有）
+    docker pull 9seconds/mtg:latest >/dev/null 2>&1
+    
+    # 用 mtg generate-secret 生成 dd 开头的 TLS 伪装密钥
     local secret
-    secret=$(openssl rand -hex 32)
+    secret=$(docker run --rm 9seconds/mtg:latest generate-secret --tls 2>/dev/null)
     echo "$secret"
 }
 
@@ -227,7 +232,12 @@ deploy_proxy() {
     divider
 
     local secret
-    secret=$(generate_secret)
+    info "正在生成代理密钥（需拉取 mtg 镜像）..."
+    secret=$(generate_mtg_secret)
+    if [[ -z "$secret" ]]; then
+        error "密钥生成失败，请检查 Docker 是否正常运行"
+        exit 1
+    fi
     info "已生成代理密钥"
 
     local port="${MTG_PORT:-$PORT_RANGE_START}"
@@ -244,7 +254,7 @@ deploy_proxy() {
 
     mkdir -p "$INSTALL_DIR"
 
-    # ========== 方案一: 使用 9seconds/mtg (Go 实现，兼容新版 Telegram) ==========
+    # ========== 9seconds/mtg: Go 实现，兼容新版 Telegram ==========
     cat > "$DOCKER_COMPOSE_FILE" <<EOF
 version: '3.8'
 
@@ -254,9 +264,7 @@ services:
     container_name: mtproto-proxy
     restart: always
     network_mode: host
-    command: run --tls --port ${port}
-    environment:
-      - MTG_SECRET=ee${secret}00000000000000000000000000000000
+    command: run ${secret} --port ${port}
     volumes:
       - proxy-data:/var/lib/mtproto-proxy
     healthcheck:
@@ -271,9 +279,7 @@ volumes:
     name: mtproto-proxy-data
 EOF
 
-    # mtg 的 secret 格式: ee + 32字节hex + 16字节padding (64个hex字符)
-    local mtg_secret="ee${secret}00000000000000000000000000000000"
-    echo "$mtg_secret" > "$CONFIG_FILE"
+    echo "$secret" > "$CONFIG_FILE"
     chmod 600 "$CONFIG_FILE"
 
     configure_firewall "$port"
@@ -306,7 +312,7 @@ EOF
     fi
 
     # tg:// 格式的链接 (Telegram 客户端直接识别)
-    local tg_link="tg://proxy?server=${server_ip}&port=${port}&secret=${mtg_secret}"
+    local tg_link="tg://proxy?server=${server_ip}&port=${port}&secret=${secret}"
 
     divider
     echo -e "${GREEN}${BOLD}       ✅ MTProto 代理部署成功！${NC}"
@@ -316,7 +322,7 @@ EOF
     echo ""
     echo -e "  ${BOLD}服务器地址:${NC}  ${GREEN}$server_ip${NC}"
     echo -e "  ${BOLD}端口:${NC}        ${GREEN}$port${NC}"
-    echo -e "  ${BOLD}密钥 (Secret):${NC}${GREEN}$mtg_secret${NC}"
+    echo -e "  ${BOLD}密钥 (Secret):${NC}${GREEN}$secret${NC}"
     echo ""
     echo -e "${CYAN}📱 客户端配置:${NC}"
     echo ""
@@ -327,13 +333,13 @@ EOF
     echo -e "  4. 填入以下信息:"
     echo -e "     服务器: ${GREEN}${server_ip}${NC}"
     echo -e "     端口:   ${GREEN}${port}${NC}"
-    echo -e "     密钥:   ${GREEN}${mtg_secret}${NC}"
+    echo -e "     密钥:   ${GREEN}${secret}${NC}"
     echo ""
     echo -e "  ${YELLOW}方式二: 快速链接${NC}"
     echo -e "  在 Telegram 中发送此链接并点击: ${CYAN}${tg_link}${NC}"
     echo ""
     echo -e "  ${YELLOW}方式三: HTTPS 伪装链接${NC}"
-    echo -e "  在 Telegram 中发送并点击: ${CYAN}https://t.me/proxy?server=${server_ip}&port=${port}&secret=${mtg_secret}${NC}"
+    echo -e "  在 Telegram 中发送并点击: ${CYAN}https://t.me/proxy?server=${server_ip}&port=${port}&secret=${secret}${NC}"
     echo ""
     divider
     echo -e "${YELLOW}💡 常用管理命令:${NC}"
@@ -352,11 +358,11 @@ EOF
 ==========================================
 服务器: $server_ip
 端口:   $port
-密钥:   $mtg_secret
+密钥:   $secret
 
 快速连接链接:
 $tg_link
-https://t.me/proxy?server=${server_ip}&port=${port}&secret=${mtg_secret}
+https://t.me/proxy?server=${server_ip}&port=${port}&secret=${secret}
 
 生成时间: $(date '+%Y-%m-%d %H:%M:%S')
 ==========================================
@@ -403,13 +409,17 @@ reconfigure_proxy() {
     info "重新配置 MTProto 代理..."
     divider
 
+    info "正在生成新密钥..."
     local new_secret
-    new_secret=$(generate_secret)
-    local new_mtg_secret="ee${new_secret}00000000000000000000000000000000"
+    new_secret=$(generate_mtg_secret)
+    if [[ -z "$new_secret" ]]; then
+        error "密钥生成失败"
+        exit 1
+    fi
 
     cd "$INSTALL_DIR"
-    sed -i "s|MTG_SECRET=.*|MTG_SECRET=${new_mtg_secret}|" "$DOCKER_COMPOSE_FILE"
-    echo "$new_mtg_secret" > "$CONFIG_FILE"
+    sed -i "s|command: run .* --port|command: run ${new_secret} --port|" "$DOCKER_COMPOSE_FILE"
+    echo "$new_secret" > "$CONFIG_FILE"
 
     docker compose down
     docker compose up -d
@@ -419,12 +429,12 @@ reconfigure_proxy() {
     if docker ps --filter "name=mtproto-proxy" --filter "status=running" -q | grep -q .; then
         success "代理已重新配置并启动"
         echo ""
-        echo -e "  ${BOLD}新密钥:${NC} ${GREEN}${new_mtg_secret}${NC}"
+        echo -e "  ${BOLD}新密钥:${NC} ${GREEN}${new_secret}${NC}"
         local server_ip
         server_ip=$(get_server_ip)
         local port
         port=$(grep -E '^\s+- "[0-9]+' "$DOCKER_COMPOSE_FILE" | grep -oE '[0-9]+' | head -1)
-        echo -e "  ${BOLD}连接链接:${NC} ${CYAN}tg://proxy?server=${server_ip}&port=${port}&secret=${new_mtg_secret}${NC}"
+        echo -e "  ${BOLD}连接链接:${NC} ${CYAN}tg://proxy?server=${server_ip}&port=${port}&secret=${new_secret}${NC}"
     else
         error "代理重启失败"
         docker logs mtproto-proxy 2>&1 | tail -10

@@ -227,6 +227,20 @@ deploy_proxy() {
         info "使用默认端口: $port"
     fi
 
+    # 检测端口是否被占用
+    while ss -tlnp | grep -q ":${port} "; do
+        warn "端口 ${port} 已被占用:"
+        ss -tlnp | grep ":${port} " | head -3
+        if [[ -t 0 ]]; then
+            read -rp "请输入其他端口 (或 Ctrl+C 退出): " input_port
+            port=${input_port:-$((port + 1))}
+        else
+            port=$((port + 1))
+            info "自动切换到端口: $port"
+        fi
+    done
+    info "使用端口: $port"
+
     # 获取服务器 IP
     local server_ip
     server_ip=$(get_server_ip)

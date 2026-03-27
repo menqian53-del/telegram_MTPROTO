@@ -57,7 +57,7 @@ detect_os() {
 check_docker() {
     if command -v docker &>/dev/null; then
         local docker_ver
-        docker_ver=$(docker --version 2>/dev/null | grep -oP '\d+\.\d+\.\d+' | head -1)
+        docker_ver=$(docker --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
         info "Docker 已安装: ${BOLD}v$docker_ver${NC}"
         DOCKER_INSTALLED=1
     else
@@ -83,6 +83,84 @@ install_docker() {
     info "正在安装 Docker 和 Docker Compose..."
     divider
 
+    if [[ "$OS" == "centos" || "$OS" == "rhel" || "$OS" == "rocky" || "$OS" == "almalinux" ]]; then
+        install_docker_centos
+    elif [[ "$OS" == "ubuntu" || "$OS" == "debian" ]]; then
+        install_docker_debian
+    else
+        error "不支持的系统: $OS，请手动安装 Docker"
+        exit 1
+    fi
+
+    # 启动 Docker
+    systemctl enable docker
+    systemctl start docker
+
+    # 验证安装
+    if ! command -v docker &>/dev/null; then
+        error "Docker 安装失败，请手动安装后重试"
+        exit 1
+    fi
+
+    info "Docker 版本: $(docker --version)"
+
+    # CentOS 7 默认不带 docker compose 插件，用独立二进制兜底
+    if ! docker compose version &>/dev/null 2>&1; then
+        warn "Docker Compose 插件未安装，正在安装独立版..."
+        local compose_arch
+        compose_arch=$(uname -m)
+        case "$compose_arch" in
+            x86_64)  compose_arch="x86_64" ;;
+            aarch64) compose_arch="aarch64" ;;
+            *)       compose_arch="x86_64" ;;
+        esac
+        mkdir -p /usr/local/lib/docker/cli-plugins
+        curl -fsSL "https://github.com/docker/compose/releases/latest/download/docker-compose-linux-${compose_arch}" \
+            -o /usr/local/lib/docker/cli-plugins/docker-compose
+        chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+        info "Docker Compose (standalone) 安装完成"
+    fi
+
+    success "Docker 和 Docker Compose 安装完成"
+}
+
+install_docker_centos() {
+    info "使用 yum 安装 Docker (CentOS/RHEL)..."
+
+    # 卸载旧版本
+    yum remove -y docker docker-client docker-client-latest \
+        docker-common docker-latest docker-latest-logrotate \
+        docker-logrotate docker-engine podman runc >/dev/null 2>&1 || true
+
+    # 安装依赖
+    yum install -y -q yum-utils device-mapper-persistent-data lvm2
+
+    # 添加 Docker 仓库
+    yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo >/dev/null 2>&1
+
+    # CentOS 7 需要用 centos/7 仓库（官方已 EOL，使用 vault）
+    if [[ "$OS" == "centos" && "${OS_VERSION%%.*}" -eq 7 ]]; then
+        # 替换 vault 源（CentOS 7 EOL 后官方移到了 vault）
+        if ! grep -q "vault.centos.org" /etc/yum.repos.d/CentOS-Base.repo 2>/dev/null; then
+            info "CentOS 7 已 EOL，切换到 vault 源..."
+            sed -i 's|^mirrorlist=|#mirrorlist=|g' /etc/yum.repos.d/CentOS-*.repo 2>/dev/null || true
+            sed -i 's|^#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' /etc/yum.repos.d/CentOS-*.repo 2>/dev/null || true
+        fi
+
+        # 安装 Docker 20.10（最后支持 CentOS 7 的版本）
+        info "CentOS 7 安装 Docker 20.10.x（兼容版本）..."
+        yum install -y -q docker-ce-20.10.* docker-ce-cli-20.10.* containerd.io
+    else
+        # CentOS 8+ / RHEL / Rocky / AlmaLinux
+        yum install -y -q docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    fi
+
+    success "Docker 安装完成"
+}
+
+install_docker_debian() {
+    info "使用 apt 安装 Docker (Ubuntu/Debian)..."
+
     # 卸载旧版本
     for pkg in docker.io docker-doc docker-compose docker-compose-v2 podman-docker containerd runc; do
         apt-get remove -y "$pkg" >/dev/null 2>&1 || true
@@ -107,11 +185,7 @@ install_docker() {
     apt-get update -qq
     apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 
-    # 启动 Docker
-    systemctl enable docker
-    systemctl start docker
-
-    success "Docker 和 Docker Compose 安装完成"
+    success "Docker 安装完成"
 }
 
 generate_secret() {
@@ -366,7 +440,7 @@ reconfigure_proxy() {
         local server_ip
         server_ip=$(get_server_ip)
         local port
-        port=$(grep -oP '(?<=- )\d+' "$DOCKER_COMPOSE_FILE" | head -1)
+        port=$(grep -E '^\s+- "[0-9]+' "$DOCKER_COMPOSE_FILE" | grep -oE '[0-9]+' | head -1)
         echo -e "  ${BOLD}连接链接:${NC} ${CYAN}https://t.me/proxy?server=${server_ip}&port=${port}&secret=${new_secret}${NC}"
     else
         error "代理重启失败"

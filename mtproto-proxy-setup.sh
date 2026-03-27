@@ -174,13 +174,25 @@ install_docker_debian() {
 }
 
 generate_mtg_secret() {
-    # 使用 mtg 容器生成正确的 secret 格式
-    # 先拉取镜像（如果还没有）
-    docker pull 9seconds/mtg:latest >/dev/null 2>&1
+    # 方式一：用 mtg 容器生成 dd 开头的 TLS 伪装密钥
+    local secret=""
+    local err_output
     
-    # 用 mtg generate-secret 生成 dd 开头的 TLS 伪装密钥
-    local secret
-    secret=$(docker run --rm 9seconds/mtg:latest generate-secret --tls 2>/dev/null)
+    # 先确保镜像存在
+    err_output=$(docker pull 9seconds/mtg:latest 2>&1)
+    if [[ $? -eq 0 ]]; then
+        secret=$(docker run --rm 9seconds/mtg:latest generate-secret --tls 2>/dev/null) || true
+    fi
+    
+    # 方式二：如果 mtg 生成失败，用 openssl 手动构造 dd 密钥
+    # dd + 32字节随机hex = 正确的 mtg TLS 伪装密钥
+    if [[ -z "$secret" ]]; then
+        warn "mtg 密钥生成失败，使用 openssl 兜底..."
+        local random_hex
+        random_hex=$(openssl rand -hex 32)
+        secret="dd${random_hex}"
+    fi
+    
     echo "$secret"
 }
 
@@ -232,13 +244,9 @@ deploy_proxy() {
     divider
 
     local secret
-    info "正在生成代理密钥（需拉取 mtg 镜像）..."
+    info "正在生成代理密钥..."
     secret=$(generate_mtg_secret)
-    if [[ -z "$secret" ]]; then
-        error "密钥生成失败，请检查 Docker 是否正常运行"
-        exit 1
-    fi
-    info "已生成代理密钥"
+    info "已生成代理密钥: ${secret:0:6}...${secret: -4}"
 
     local port="${MTG_PORT:-$PORT_RANGE_START}"
     if [[ -t 0 ]]; then

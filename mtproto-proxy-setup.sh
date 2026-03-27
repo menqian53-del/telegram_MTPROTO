@@ -5,7 +5,7 @@
 #  用法: bash mtproto-proxy-setup.sh
 #=============================================================================
 
-set -euo pipefail
+set -eo pipefail
 
 #======================= 颜色定义 =======================
 RED='\033[0;31m'
@@ -206,7 +206,7 @@ get_server_ip() {
 
     if [[ "$ip" == "YOUR_SERVER_IP" ]]; then
         warn "无法自动获取公网 IP，请手动输入"
-        read -rp "请输入服务器公网 IP: " ip
+        read -rp "请输入服务器公网 IP: " ip < /dev/tty 2>/dev/null || true
     fi
     echo "$ip"
 }
@@ -250,10 +250,15 @@ deploy_proxy() {
     secret=$(generate_secret)
     info "已生成代理密钥"
 
-    # 获取端口
-    local port=$PORT_RANGE_START
-    read -rp "请设置代理端口 (默认 $port): " input_port
-    port=${input_port:-$port}
+    # 获取端口（支持环境变量传入，默认1443）
+    local port="${MTG_PORT:-$PORT_RANGE_START}"
+    if [[ -t 0 ]]; then
+        # 交互模式，允许用户输入
+        read -rp "请设置代理端口 (默认 $port): " input_port
+        port=${input_port:-$port}
+    else
+        info "使用默认端口: $port"
+    fi
 
     # 获取服务器 IP
     local server_ip
@@ -389,7 +394,7 @@ uninstall_proxy() {
     divider
     warn "即将卸载 MTProto 代理..."
     divider
-    read -rp "确认卸载？(y/N): " confirm
+    read -rp "确认卸载？(y/N): " confirm < /dev/tty 2>/dev/null || confirm="y"
     if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
         info "已取消卸载"
         exit 0
